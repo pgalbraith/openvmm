@@ -5914,6 +5914,7 @@ dependencies = [
  "unicycle",
  "unix_socket",
  "vfio_assigned_device_resources",
+ "vhost_user_protocol",
  "video_core",
  "virt_whp",
  "virtio_resources",
@@ -9507,8 +9508,10 @@ dependencies = [
  "open_enum",
  "pal_async",
  "parking_lot",
+ "sparse_mmap",
  "thiserror 2.0.16",
  "unix_socket",
+ "windows-sys 0.61.0",
  "zerocopy",
 ]
 

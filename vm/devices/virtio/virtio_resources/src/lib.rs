@@ -167,25 +167,49 @@ pub mod console {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod vhost_user {
     use mesh::MeshPayload;
-    use std::os::fd::OwnedFd;
+    use unix_socket::UnixStream;
     use vm_resource::ResourceId;
     use vm_resource::kind::VirtioDeviceHandle;
+
+    #[cfg(windows)]
+    use std::os::windows::io::OwnedHandle;
+
+    /// A connected vhost-user control channel, and what is needed to pass
+    /// operating-system objects over it.
+    #[derive(MeshPayload)]
+    pub struct VhostUserConnection {
+        /// Connected Unix socket to the vhost-user backend.
+        pub socket: UnixStream,
+        /// A handle to the backend process, carrying `PROCESS_DUP_HANDLE`.
+        ///
+        /// Windows `AF_UNIX` sockets carry no ancillary data, so guest memory
+        /// sections and vring doorbells are duplicated into the backend
+        /// process rather than sent as descriptors, and that takes a handle to
+        /// the process. It cannot be derived from the socket — there are no
+        /// peer credentials, and a process ID would be racy because IDs are
+        /// reused — so whoever launched the backend has to broker one.
+        ///
+        /// `None` leaves the connection able to exchange plain messages only:
+        /// the first message carrying an object fails instead.
+        #[cfg(windows)]
+        pub backend_process: Option<OwnedHandle>,
+    }
 
     /// Handle for a generic vhost-user device backed by an external process.
     ///
     /// The socket must already be connected. The CLI layer connects
-    /// to the backend and passes the connected fd here.
+    /// to the backend and passes the connected socket here.
     ///
     /// For device types with specific handles (FS, BLK), use those
     /// instead. This handle is for devices identified only by their
     /// numeric virtio device ID.
     #[derive(MeshPayload)]
     pub struct VhostUserGenericHandle {
-        /// Connected Unix socket fd to the vhost-user backend.
-        pub socket: OwnedFd,
+        /// Connected control channel to the vhost-user backend.
+        pub connection: VhostUserConnection,
         /// Virtio device ID (e.g., 2 for block, 1 for net).
         pub device_id: u16,
         /// Per-queue sizes. Length determines the queue count.
@@ -205,8 +229,8 @@ pub mod vhost_user {
     /// behavior of cloud-hypervisor.
     #[derive(MeshPayload)]
     pub struct VhostUserFsHandle {
-        /// Connected Unix socket fd to the vhost-user backend.
-        pub socket: OwnedFd,
+        /// Connected control channel to the vhost-user backend.
+        pub connection: VhostUserConnection,
         /// The mount tag exposed to the guest (max 36 bytes).
         pub tag: String,
         /// Number of request queues (default 1 in resolver).
@@ -222,8 +246,8 @@ pub mod vhost_user {
     /// Handle for a vhost-user virtio-blk device.
     #[derive(MeshPayload)]
     pub struct VhostUserBlkHandle {
-        /// Connected Unix socket fd to the vhost-user backend.
-        pub socket: OwnedFd,
+        /// Connected control channel to the vhost-user backend.
+        pub connection: VhostUserConnection,
         /// Number of queues (default 1 in resolver).
         pub num_queues: Option<u16>,
         /// Queue size for all queues (default 128 in resolver).

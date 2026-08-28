@@ -7,14 +7,13 @@ use crate::VhostUserFrontend;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use pal_async::socket::PolledSocket;
-use std::os::fd::OwnedFd;
-use unix_socket::UnixStream;
 use vhost_user_protocol::VhostUserSocket;
 use virtio::resolve::ResolvedVirtioDevice;
 use virtio::resolve::VirtioResolveInput;
 use virtio::spec::VirtioDeviceType;
 use virtio::spec::fs as virtio_fs;
 use virtio_resources::vhost_user::VhostUserBlkHandle;
+use virtio_resources::vhost_user::VhostUserConnection;
 use virtio_resources::vhost_user::VhostUserFsHandle;
 use virtio_resources::vhost_user::VhostUserGenericHandle;
 use vm_resource::AsyncResolveResource;
@@ -33,16 +32,27 @@ declare_static_async_resolver! {
     (VirtioDeviceHandle, VhostUserBlkHandle),
 }
 
-/// Connect a vhost-user socket fd and create the frontend.
+/// Wrap a connected vhost-user control channel and create the frontend.
 async fn connect_frontend(
     input: VirtioResolveInput<'_>,
-    socket_fd: OwnedFd,
+    connection: VhostUserConnection,
     config: crate::VhostUserConfig,
 ) -> anyhow::Result<VhostUserFrontend> {
     let driver = input.driver_source.simple();
-    let stream = UnixStream::from(socket_fd);
-    let polled =
-        PolledSocket::new(&driver, stream).context("failed to register vhost-user socket")?;
+    let polled = PolledSocket::new(&driver, connection.socket)
+        .context("failed to register vhost-user socket")?;
+
+    // On Windows, guest memory and the doorbells are duplicated into the
+    // backend process, so the frontend needs a handle to it. Without one the
+    // connection still negotiates, and fails on the first message that carries
+    // an object — which reports the missing handle at the point it is needed
+    // rather than refusing a connection that may never need it.
+    #[cfg(windows)]
+    let socket = match connection.backend_process {
+        Some(process) => VhostUserSocket::with_peer_process(polled, process),
+        None => VhostUserSocket::new(polled),
+    };
+    #[cfg(unix)]
     let socket = VhostUserSocket::new(polled);
 
     VhostUserFrontend::from_socket(driver, socket, config)
@@ -73,7 +83,7 @@ impl AsyncResolveResource<VirtioDeviceHandle, VhostUserGenericHandle>
             queue_sizes: resource.queue_sizes,
             config_patches: vec![],
         };
-        let frontend = connect_frontend(input, resource.socket, config).await?;
+        let frontend = connect_frontend(input, resource.connection, config).await?;
         Ok(frontend.into())
     }
 }
@@ -118,7 +128,7 @@ impl AsyncResolveResource<VirtioDeviceHandle, VhostUserFsHandle> for VhostUserFr
             config_patches: vec![(0, config.as_bytes().to_vec())],
         };
 
-        let frontend = connect_frontend(input, resource.socket, vhost_config)
+        let frontend = connect_frontend(input, resource.connection, vhost_config)
             .await
             .context("failed to set up vhost-user-fs device")?;
 
@@ -155,7 +165,7 @@ impl AsyncResolveResource<VirtioDeviceHandle, VhostUserBlkHandle> for VhostUserF
             config_patches,
         };
 
-        let frontend = connect_frontend(input, resource.socket, config)
+        let frontend = connect_frontend(input, resource.connection, config)
             .await
             .context("failed to set up vhost-user-blk device")?;
 

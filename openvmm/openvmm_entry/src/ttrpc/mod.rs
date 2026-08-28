@@ -2080,8 +2080,12 @@ fn build_serial_backend(
     }
 }
 
-/// Builds a vhost-user-backed virtio device. Only supported on unix, where the
-/// backend is reached over a Unix domain socket.
+/// Builds a vhost-user-backed virtio device.
+///
+/// Unix only. Windows reaches a backend over the same kind of socket, but has
+/// to duplicate guest memory and the doorbells into the backend process, and
+/// the vmservice API has no way to convey a handle to it — see the
+/// `backend_process` option on `--vhost-user`.
 #[cfg(unix)]
 fn build_vhost_user_device(
     vhost_user: vmservice::VhostUser,
@@ -2094,6 +2098,7 @@ fn build_vhost_user_device(
     } = vhost_user;
     let stream = unix_socket::UnixStream::connect(&socket_path)
         .with_context(|| format!("failed to connect to vhost-user socket: {socket_path}"))?;
+    let connection = virtio_resources::vhost_user::VhostUserConnection { socket: stream };
     let vmservice::VhostUserDevice { kind } = device.context("missing vhost-user device")?;
     let to_u16 =
         |v: u32| -> anyhow::Result<u16> { v.try_into().context("queue value out of range") };
@@ -2102,7 +2107,7 @@ fn build_vhost_user_device(
             num_queues,
             queue_size,
         }) => virtio_resources::vhost_user::VhostUserBlkHandle {
-            socket: stream.into(),
+            connection,
             num_queues: num_queues.map(to_u16).transpose()?,
             queue_size: queue_size.map(to_u16).transpose()?,
         }
@@ -2112,7 +2117,7 @@ fn build_vhost_user_device(
             num_queues,
             queue_size,
         }) => virtio_resources::vhost_user::VhostUserFsHandle {
-            socket: stream.into(),
+            connection,
             tag,
             num_queues: num_queues.map(to_u16).transpose()?,
             queue_size: queue_size.map(to_u16).transpose()?,
@@ -2122,7 +2127,7 @@ fn build_vhost_user_device(
             device_id,
             queue_sizes,
         }) => virtio_resources::vhost_user::VhostUserGenericHandle {
-            socket: stream.into(),
+            connection,
             device_id: to_u16(device_id)?,
             queue_sizes: queue_sizes
                 .into_iter()

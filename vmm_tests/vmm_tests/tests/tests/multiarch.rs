@@ -923,6 +923,7 @@ async fn vhost_user_blk_device<T>(
     use pal_async::pipe::PolledPipe;
     use pal_async::task::Spawn;
     use virtio_resources::vhost_user::VhostUserBlkHandle;
+    use virtio_resources::vhost_user::VhostUserConnection;
     use vm_resource::IntoResource;
 
     let (openvmm_vhost_artifact,) = extra_deps;
@@ -1001,7 +1002,7 @@ async fn vhost_user_blk_device<T>(
         unix_socket::UnixStream::connect(&socket_path).context("connect to vhost-user socket")?;
 
     let vhost_resource = VhostUserBlkHandle {
-        socket: stream.into(),
+        connection: VhostUserConnection { socket: stream },
         num_queues: None,
         queue_size: None,
     }

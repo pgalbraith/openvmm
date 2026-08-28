@@ -13,9 +13,9 @@ guestmem.workspace = true
 inspect.workspace = true
 pal_async.workspace = true
 pal_event.workspace = true
+sparse_mmap.workspace = true
 tracelimit.workspace = true
 tracing.workspace = true
-unix_socket.workspace = true
 vhost_user_protocol.workspace = true
 virtio.workspace = true
 virtio_resources.workspace = true
@@ -27,10 +27,11 @@ zerocopy.workspace = true
 pal_async = { workspace = true, features = ["tests"] }
 socket2 = { workspace = true, features = ["all"] }
 test_with_tracing.workspace = true
-vhost_user_backend.workspace = true
-sparse_mmap.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+# The loopback tests drive `vhost_user_backend`, which is Linux-only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+unix_socket.workspace = true
+vhost_user_backend.workspace = true
 
 [lints]
 workspace = true

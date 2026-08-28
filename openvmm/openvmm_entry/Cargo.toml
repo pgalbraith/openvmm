@@ -107,6 +107,8 @@ vmswitch.workspace = true
 virt_whp.workspace = true
 vmbus_proxy.workspace = true
 whp.workspace = true
+# For adopting the backend process handle passed to `--vhost-user`.
+vhost_user_protocol.workspace = true
 
 win_etw_tracing.workspace = true
 
@@ -116,6 +118,7 @@ features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
 ]
+
 
 [build-dependencies]
 build_rs_guest_arch.workspace = true

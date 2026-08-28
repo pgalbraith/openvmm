@@ -538,7 +538,18 @@ options:
     ///   queue_size=N                       — per-queue size (type=blk/fs only)
     ///   queue_sizes=[N,N,N]                — per-queue sizes (device_id= only)
     ///   pcie_port=NAME                     — present on PCIe under the specified port
+    ///   backend_process=HANDLE             — Windows only; see below
     /// ```
+    ///
+    /// On Windows the backend cannot be handed guest memory and doorbells as
+    /// file descriptors, because `AF_UNIX` sockets there carry no ancillary
+    /// data. They are duplicated into the backend process instead, which takes
+    /// a handle to it carrying `PROCESS_DUP_HANDLE`. That handle cannot be
+    /// derived from the socket — there are no peer credentials, and a process
+    /// ID would be racy because IDs are reused — so whoever launched the
+    /// backend must pass one in, as the numeric value of a handle inherited by
+    /// this process. Without it the connection is still made, and fails on the
+    /// first message carrying an object.
     ///
     /// Examples:
     ///
@@ -549,8 +560,9 @@ options:
     ///   --vhost-user /tmp/vhost.sock,type=blk,pcie_port=port0
     ///   --vhost-user /tmp/virtiofsd.sock,type=fs,tag=myfs
     ///   --vhost-user /tmp/virtiofsd.sock,type=fs,tag=myfs,num_queues=2,queue_size=1024
+    ///   --vhost-user C:\run\vfsd.sock,type=fs,tag=myfs,backend_process=1234
     /// ```
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[clap(long = "vhost-user")]
     pub vhost_user: Vec<VhostUserCli>,
 
@@ -3371,7 +3383,7 @@ impl From<&std::ffi::OsStr> for OptionalPathBuf {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Clone)]
 pub enum VhostUserDeviceTypeCli {
     /// Block device — config from backend via GET_CONFIG, with num_queues
@@ -3393,17 +3405,23 @@ pub enum VhostUserDeviceTypeCli {
     },
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Clone)]
 pub struct VhostUserCli {
     pub socket_path: String,
     pub device_type: VhostUserDeviceTypeCli,
     pub pcie_port: Option<String>,
+    /// Numeric value of an inherited handle to the backend process, used on
+    /// Windows to duplicate guest memory and doorbells into it.
+    ///
+    /// Kept as the raw value rather than an owned handle so that this type
+    /// stays `Clone`; it is adopted once, where the device is built.
+    pub backend_process: Option<u64>,
 }
 
 /// Raw `--vhost-user` options, resolved into a [`VhostUserCli`] by its
 /// `FromStr`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(vmm_cli::KeyValueArgs)]
 struct VhostUserArgs {
     #[kv(positional)]
@@ -3416,9 +3434,12 @@ struct VhostUserArgs {
     num_queues: Option<u16>,
     queue_size: Option<u16>,
     queue_sizes: Option<vmm_cli::BracketList<u16>>,
+    /// Accepted on every platform so that using it where it has no meaning
+    /// reports that, rather than looking like a typo.
+    backend_process: Option<u64>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl FromStr for VhostUserCli {
     type Err = anyhow::Error;
 
@@ -3469,10 +3490,18 @@ impl FromStr for VhostUserCli {
             );
         }
 
+        if cfg!(not(windows)) && args.backend_process.is_some() {
+            anyhow::bail!(
+                "backend_process= is only valid on Windows; elsewhere the backend receives \
+                 descriptors over the socket and needs nothing from the launcher"
+            );
+        }
+
         Ok(VhostUserCli {
             socket_path: args.socket_path,
             device_type,
             pcie_port: args.pcie_port,
+            backend_process: args.backend_process,
         })
     }
 }

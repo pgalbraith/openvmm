@@ -1843,7 +1843,7 @@ async fn vm_config_from_command_line(
     }
 
     // Handle --vhost-user arguments.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     for vhost_cli in &opt.vhost_user {
         let stream =
             unix_socket::UnixStream::connect(&vhost_cli.socket_path).with_context(|| {
@@ -1853,6 +1853,22 @@ async fn vm_config_from_command_line(
                 )
             })?;
 
+        // On Windows the backend is handed guest memory and doorbells by
+        // duplication into its process, so adopt the handle the launcher
+        // passed. Doing it here reports a bad value while the device is being
+        // configured, rather than at the first message that needs it.
+        #[cfg(windows)]
+        let connection = virtio_resources::vhost_user::VhostUserConnection {
+            socket: stream,
+            backend_process: vhost_cli
+                .backend_process
+                .map(vhost_user_protocol::win32::adopt_process_handle)
+                .transpose()
+                .context("invalid backend_process= handle")?,
+        };
+        #[cfg(unix)]
+        let connection = virtio_resources::vhost_user::VhostUserConnection { socket: stream };
+
         use crate::cli_args::VhostUserDeviceTypeCli;
         let resource: Resource<VirtioDeviceHandle> = match vhost_cli.device_type {
             VhostUserDeviceTypeCli::Fs {
@@ -1860,7 +1876,7 @@ async fn vm_config_from_command_line(
                 num_queues,
                 queue_size,
             } => virtio_resources::vhost_user::VhostUserFsHandle {
-                socket: stream.into(),
+                connection,
                 tag: tag.clone(),
                 num_queues,
                 queue_size,
@@ -1870,7 +1886,7 @@ async fn vm_config_from_command_line(
                 num_queues,
                 queue_size,
             } => virtio_resources::vhost_user::VhostUserBlkHandle {
-                socket: stream.into(),
+                connection,
                 num_queues,
                 queue_size,
             }
@@ -1879,7 +1895,7 @@ async fn vm_config_from_command_line(
                 device_id,
                 ref queue_sizes,
             } => virtio_resources::vhost_user::VhostUserGenericHandle {
-                socket: stream.into(),
+                connection,
                 device_id,
                 queue_sizes: queue_sizes.clone(),
             }

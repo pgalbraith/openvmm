@@ -105,7 +105,7 @@ vm_resource::register_static_resolvers! {
     virtio_net::resolver::VirtioNetResolver,
     virtio_pmem::resolver::VirtioPmemResolver,
     virtio_rng::resolver::VirtioRngResolver,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     vhost_user_frontend::resolver::VhostUserFrontendResolver,
     virtio_vsock::resolver::VirtioVsockResolver,
     #[cfg(target_os = "linux")]
