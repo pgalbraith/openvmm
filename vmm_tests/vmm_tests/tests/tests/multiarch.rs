@@ -1072,3 +1072,98 @@ async fn vhost_user_blk_device<T>(
 
     Ok(())
 }
+
+/// Boot with a virtio-fs share served by an external virtiofsd over a
+/// vhost-user socket, and round-trip a file through it.
+///
+/// virtiofsd is not built by this repository, so this is skipped unless
+/// `PETRI_VIRTIOFSD_BINARY` names one to test against.
+///
+/// On Windows this is the end-to-end check of the handle-duplication
+/// transport: reading back what the guest wrote proves the daemon received
+/// the duplicated guest RAM section and doorbells, and served FUSE traffic
+/// through them. On POSIX the same path runs over SCM_RIGHTS.
+#[openvmm_test(linux_direct_x64, linux_direct_aarch64)]
+async fn vhost_user_fs_device(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    use openvmm_defs::config::VirtioBus;
+    use petri::virtiofsd::Virtiofsd;
+    use vm_resource::IntoResource;
+
+    const TAG: &str = "testfs";
+    /// What the host leaves for the guest to read.
+    const FROM_HOST: &str = "hello_from_host";
+    /// What the guest writes for the host to read back.
+    const FROM_GUEST: &str = "hello_from_guest";
+
+    if petri::virtiofsd::binary_path().is_none() {
+        tracing::warn!(
+            "skipping: {} is not set, so there is no virtiofsd to test against",
+            petri::virtiofsd::BINARY_ENV
+        );
+        return Ok(());
+    }
+
+    let tmp_dir = tempfile::tempdir().context("create temp dir")?;
+    let shared_dir = tmp_dir.path().join("shared");
+    let socket_path = tmp_dir.path().join("virtiofsd.sock");
+    std::fs::create_dir(&shared_dir).context("create shared dir")?;
+    std::fs::write(shared_dir.join("from_host.txt"), FROM_HOST).context("seed shared dir")?;
+
+    // Launching the daemon is what makes this test the broker: on Windows the
+    // frontend can only duplicate guest memory into a process it holds a
+    // handle to, and only the launcher has one.
+    let log_file = config.log_source().log_file("virtiofsd")?;
+    let virtiofsd = Virtiofsd::spawn(config.driver(), log_file, &shared_dir, &socket_path)
+        .await
+        .context("launch virtiofsd")?;
+
+    let fs_resource = virtiofsd.fs_handle(TAG)?.into_resource();
+
+    let (vm, agent) = config
+        // The daemon maps guest RAM directly, so it has to be shareable.
+        .with_memory(MemoryConfig {
+            private_memory: Some(false),
+            ..Default::default()
+        })
+        .modify_backend(move |b| {
+            b.with_custom_config(|c| {
+                c.virtio_devices.push((VirtioBus::Mmio, fs_resource));
+            })
+        })
+        .run()
+        .await?;
+
+    agent
+        .mount(TAG, "/mnt", "virtiofs", 0, true)
+        .await
+        .context("mount virtiofs — is CONFIG_VIRTIO_FS=y in the guest kernel?")?;
+
+    let sh = agent.unix_shell();
+
+    // Read what the host wrote: proves FUSE reads reach real file data.
+    let read_back = cmd!(sh, "cat /mnt/from_host.txt")
+        .read()
+        .await
+        .context("read the host's file from the share")?;
+    assert_eq!(read_back.trim(), FROM_HOST, "host file read back wrong");
+
+    // Write from the guest and check the host sees it, which exercises the
+    // path in the other direction.
+    cmd!(sh, "sh -c 'echo hello_from_guest > /mnt/from_guest.txt'")
+        .read()
+        .await
+        .context("write a file into the share")?;
+
+    let on_host = std::fs::read_to_string(shared_dir.join("from_guest.txt"))
+        .context("read the guest's file on the host")?;
+    assert_eq!(on_host.trim(), FROM_GUEST, "guest file arrived wrong");
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+
+    // The daemon serves one connection and exits when the frontend goes away.
+    let status = virtiofsd.wait()?;
+    assert!(status.success(), "virtiofsd exited with status: {status}");
+
+    Ok(())
+}

@@ -1765,6 +1765,12 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         &self.resources.log_source
     }
 
+    /// Get the async driver, for work a test runs alongside the VM — such as
+    /// a helper process it launches and logs.
+    pub fn driver(&self) -> &DefaultDriver {
+        &self.resources.driver
+    }
+
     /// Get the default OpenHCL servicing flags for this config
     pub fn default_servicing_flags(&self) -> OpenHclServicingFlags {
         T::default_servicing_flags()

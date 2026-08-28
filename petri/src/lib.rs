@@ -20,6 +20,7 @@ pub mod openhcl_diag;
 pub mod requirements;
 mod test;
 mod tracing;
+pub mod virtiofsd;
 mod vm;
 mod worker;
 
