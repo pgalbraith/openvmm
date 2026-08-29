@@ -637,6 +637,11 @@ mshv-bindings = "0.6.8"
 mshv-ioctls = "0.6.8"
 uefi = "0.35.0"
 vfio-bindings = "0.4.0"
+# The windows-raw branch carries the Windows vhost-user binding (objects duplicated into the
+# backend process rather than passed as SCM_RIGHTS descriptors); pending upstream in
+# rust-vmm/vhost.
+vhost = { git = "https://github.com/pgalbraith/vhost.git", branch = "windows-raw", features = ["vhost-user-frontend"] }
+vmm-sys-util = "0.15.0"
 x86_64 = { version = "0.15.2", default-features = false }
 
 # --- Debugging / profiling ---
@@ -666,6 +671,7 @@ signal-hook = { version = "0.3", default-features = false }
 
 # --- Windows bindings ---
 ntapi = "0.4"
+uds_windows = "1.2.1"
 win_etw_provider = "0.1.11"
 win_etw_tracing = "0.1.4"
 winapi = "0.3"
@@ -745,6 +751,11 @@ overflow-checks = false
 bitvec = { git = "https://github.com/smalis-msft/bitvec", branch = "set-aliased-previous-val" }
 # Pending <https://github.com/influxdata/pbjson/pull/94>
 pbjson-build = { git = "https://github.com/jstarks/pbjson", branch = "aliases" }
+# Windows support (file-mapping sections, events, AF_UNIX descriptors) that the vhost fork above
+# builds on; pending upstream in rust-vmm. `[patch]` only applies from the top-level manifest, so
+# the vhost fork's own pins to these revs do not reach here and this workspace must repeat them.
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307" }
 
 [workspace.lints.rust]
 # Lint groups need a priority lower than individual lints so they get applied first.
@@ -829,3 +840,4 @@ box_default = "allow"
 single_range_in_vec_init = "allow"
 # This lint is purely style, and we are ok with inlined and uninlined format args.
 uninlined_format_args = "allow"
+

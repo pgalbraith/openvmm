@@ -117,6 +117,31 @@ impl BorrowedHandleExt for BorrowedHandle<'_> {
     }
 }
 
+/// Adopts ownership of a handle from its raw numeric value, as passed by a
+/// process that created this one with the handle inherited.
+///
+/// Only liveness in this process is checked (via `GetHandleInformation`);
+/// what the handle refers to and what access it carries surface when the
+/// handle is used.
+pub fn adopt_inherited_handle(value: u64) -> Result<OwnedHandle> {
+    let handle = value as usize as RawHandle;
+    if handle.is_null() {
+        return Err(Error::new(
+            io::ErrorKind::InvalidInput,
+            "handle value is null",
+        ));
+    }
+    let mut flags = 0u32;
+    // SAFETY: querying an arbitrary handle value is safe; the call reports
+    // validity rather than trapping on a bad one.
+    if unsafe { windows_sys::Win32::Foundation::GetHandleInformation(handle, &mut flags) } == 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: `handle` is a live handle in this process, inherited from the
+    // launcher, and owned by the caller from here on.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+
 pub trait OwnedSocketExt: Sized {
     /// Prepares the socket for being sent to another process.
     ///

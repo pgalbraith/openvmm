@@ -11,16 +11,9 @@ bitfield-struct.workspace = true
 open_enum.workspace = true
 pal_async.workspace = true
 parking_lot.workspace = true
-sparse_mmap.workspace = true
 thiserror.workspace = true
 unix_socket.workspace = true
 zerocopy.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
-] }
 
 [lints]
 workspace = true

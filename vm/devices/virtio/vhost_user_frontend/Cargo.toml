@@ -9,29 +9,34 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+blocking.workspace = true
 guestmem.workspace = true
 inspect.workspace = true
-pal_async.workspace = true
 pal_event.workspace = true
-sparse_mmap.workspace = true
 tracelimit.workspace = true
 tracing.workspace = true
-vhost_user_protocol.workspace = true
+unix_socket.workspace = true
+vhost.workspace = true
 virtio.workspace = true
 virtio_resources.workspace = true
 vm_resource.workspace = true
 vmcore.workspace = true
+vmm-sys-util.workspace = true
 zerocopy.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
 
 [dev-dependencies]
 pal_async = { workspace = true, features = ["tests"] }
 socket2 = { workspace = true, features = ["all"] }
+sparse_mmap.workspace = true
 test_with_tracing.workspace = true
 
 # The loopback tests drive `vhost_user_backend`, which is Linux-only.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-unix_socket.workspace = true
 vhost_user_backend.workspace = true
+vhost_user_protocol.workspace = true
 
 [lints]
 workspace = true

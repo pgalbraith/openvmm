@@ -548,8 +548,7 @@ options:
     /// derived from the socket — there are no peer credentials, and a process
     /// ID would be racy because IDs are reused — so whoever launched the
     /// backend must pass one in, as the numeric value of a handle inherited by
-    /// this process. Without it the connection is still made, and fails on the
-    /// first message carrying an object.
+    /// this process. Without it the device cannot be created on Windows.
     ///
     /// Examples:
     ///

@@ -192,8 +192,8 @@ pub mod vhost_user {
         /// peer credentials, and a process ID would be racy because IDs are
         /// reused — so whoever launched the backend has to broker one.
         ///
-        /// `None` leaves the connection able to exchange plain messages only:
-        /// the first message carrying an object fails instead.
+        /// `None` fails device creation: every vhost-user device eventually
+        /// hands objects over, so a connection that cannot is not useful.
         #[cfg(windows)]
         pub backend_process: Option<OwnedHandle>,
     }

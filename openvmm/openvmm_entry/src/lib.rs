@@ -1862,7 +1862,7 @@ async fn vm_config_from_command_line(
             socket: stream,
             backend_process: vhost_cli
                 .backend_process
-                .map(vhost_user_protocol::win32::adopt_process_handle)
+                .map(pal::windows::adopt_inherited_handle)
                 .transpose()
                 .context("invalid backend_process= handle")?,
         };

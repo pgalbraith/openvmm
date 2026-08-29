@@ -107,8 +107,6 @@ vmswitch.workspace = true
 virt_whp.workspace = true
 vmbus_proxy.workspace = true
 whp.workspace = true
-# For adopting the backend process handle passed to `--vhost-user`.
-vhost_user_protocol.workspace = true
 
 win_etw_tracing.workspace = true
 

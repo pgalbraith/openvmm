@@ -25,7 +25,6 @@ use crate::memory::MemoryRegionInfo;
 use crate::memory::build_guest_memory;
 use crate::protocol::*;
 use crate::queue_setup::QueueSetup;
-use crate::socket::MessageReceiver;
 use crate::socket::SocketError;
 use crate::socket::VhostUserSocket;
 use anyhow::Context as _;
@@ -35,6 +34,7 @@ use pal_async::socket::PolledSocket;
 use pal_event::Event;
 use std::os::fd::OwnedFd;
 use std::path::Path;
+use unix_socket::ScmReceiver;
 use unix_socket::UnixListener;
 use vhost_user_protocol::VHOST_USER_MAX_FDS;
 use virtio::DeviceTraits;
@@ -123,7 +123,7 @@ impl VhostUserDeviceServer {
 
         // Reused across the connection so each recv doesn't allocate a control
         // buffer for fd passing.
-        let mut receiver = MessageReceiver::new();
+        let mut receiver = ScmReceiver::new(VHOST_USER_MAX_FDS);
 
         loop {
             let (hdr, payload, fds) = match socket.recv_message(&mut receiver).await {
@@ -825,7 +825,7 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         send_msg(socket, code, payload, &[] as &[OwnedFd]).await;
-        let mut receiver = MessageReceiver::new();
+        let mut receiver = ScmReceiver::new(VHOST_USER_MAX_FDS);
         let (hdr, reply_payload, _fds) = socket
             .recv_message(&mut receiver)
             .await

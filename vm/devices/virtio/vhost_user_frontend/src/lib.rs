@@ -1,33 +1,37 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg(any(target_os = "linux", windows))]
 
 //! vhost-user frontend: a [`VirtioDevice`] implementation that forwards
 //! device operations to an external vhost-user backend over a Unix socket.
 //!
-//! This is the counterpart to the `VhostUserDeviceServer` in the
-//! `vhost_user_backend` crate: the server hosts a device, while this
-//! frontend connects to that server and presents it to the VMM as a
-//! standard virtio device.
+//! The protocol itself is spoken by the `vhost` crate's
+//! [`Frontend`](vhost::vhost_user::Frontend), on both platforms: POSIX passes
+//! guest memory sections and vring doorbells as `SCM_RIGHTS` descriptors,
+//! while on Windows — where `AF_UNIX` sockets carry no ancillary data — they
+//! are duplicated into the backend process instead, which is why the Windows
+//! constructor takes a handle to that process. This crate maps openvmm's
+//! device model onto that frontend: guest memory regions from [`guestmem`],
+//! doorbells from [`pal_event`], and the [`VirtioDevice`] contract on top.
 //!
-//! The socket is an `AF_UNIX` stream on Windows too, and the messages are the
-//! same. Guest memory sections and vring doorbells reach the backend by a
-//! different route there — duplicated into its process rather than sent as
-//! `SCM_RIGHTS` descriptors — which is why this frontend needs a handle to
-//! that process; see [`vhost_user_protocol::win32`] and
-//! [`VhostUserSocket::with_peer_process`].
+//! The `vhost` frontend does blocking socket I/O, so every control-plane call
+//! runs on the blocking thread pool via [`blocking::unblock`].
 
 pub mod resolver;
 
 use anyhow::Context as _;
+use blocking::unblock;
 use guestmem::GuestMemory;
-use guestmem::ShareableRegion;
 use inspect::InspectMut;
-use sparse_mmap::AsMappableRef;
-use sparse_mmap::Mappable;
-use vhost_user_protocol::*;
+use vhost::VhostBackend as _;
+use vhost::VhostUserMemoryRegionInfo;
+use vhost::VringConfigData;
+use vhost::vhost_user::Frontend;
+use vhost::vhost_user::VhostUserFrontend as _;
+use vhost::vhost_user::message::VhostUserConfigFlags;
+use vhost::vhost_user::message::VhostUserHeaderFlag;
+use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use virtio::DeviceTraits;
 use virtio::DeviceTraitsSharedMemory;
 use virtio::QueueResources;
@@ -37,8 +41,6 @@ use virtio::spec::VirtioDeviceFeatures;
 use virtio::spec::VirtioDeviceType;
 use vmcore::interrupt::EventProxy;
 use vmcore::vm_task::VmTaskDriver;
-use zerocopy::FromBytes;
-use zerocopy::IntoBytes;
 
 /// Offset added to GPAs to produce the "userspace VA" coordinate system
 /// used in the vhost-user protocol. The vhost-user spec expresses vring
@@ -95,11 +97,7 @@ pub struct VhostUserFrontend {
     driver: VmTaskDriver,
     device_traits: DeviceTraits,
     protocol_features: VhostUserProtocolFeatures,
-    socket: VhostUserSocket,
-    /// Reusable per-connection receive state, so each recv doesn't allocate
-    /// (on POSIX, the control buffer used for fd passing). The socket is used
-    /// strictly sequentially (request/reply), so a single receiver suffices.
-    receiver: MessageReceiver,
+    frontend: Frontend,
     /// Per-queue sizes. `queue_size()` indexes into this.
     queue_sizes: Vec<u16>,
     /// Sparse patches applied to config reads. Each entry is
@@ -122,63 +120,150 @@ pub struct VhostUserFrontend {
     guest_memory: Option<GuestMemory>,
 }
 
+/// Run a blocking vhost-user control-plane call on the blocking thread pool.
+///
+/// `Frontend` is a cheap handle sharing one connection, so the clone moved
+/// into the closure speaks over the same socket; its methods do blocking
+/// socket I/O, which must stay off the async executor threads.
+async fn call<R: 'static + Send>(
+    frontend: &Frontend,
+    f: impl FnOnce(&mut Frontend) -> vhost::Result<R> + 'static + Send,
+) -> vhost::Result<R> {
+    let mut frontend = frontend.clone();
+    unblock(move || f(&mut frontend)).await
+}
+
+// UNSAFETY: needed to transfer ownership of duplicated OS objects into the
+// `vhost` crate's wrapper types, which only offer raw-descriptor
+// constructors.
+#[expect(unsafe_code)]
+mod convert {
+    use vmm_sys_util::eventfd::EventFd;
+
+    /// Duplicate `event` into the [`EventFd`] wrapper the `vhost` crate
+    /// sends doorbells from. The wire only carries the underlying object, so
+    /// the wrapper's read/write semantics never come into play here.
+    pub(crate) fn event_to_eventfd(event: &pal_event::Event) -> std::io::Result<EventFd> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            use std::os::fd::FromRawFd;
+            use std::os::fd::IntoRawFd;
+            let fd = event.as_fd().try_clone_to_owned()?;
+            // SAFETY: `fd` is an owned duplicate whose ownership transfers to
+            // the returned `EventFd`, which closes it on drop.
+            Ok(unsafe { EventFd::from_raw_fd(fd.into_raw_fd()) })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle;
+            use std::os::windows::io::FromRawHandle;
+            use std::os::windows::io::IntoRawHandle;
+            let handle = event.as_handle().try_clone_to_owned()?;
+            // SAFETY: `handle` is an owned duplicate whose ownership
+            // transfers to the returned `EventFd`, which closes it on drop.
+            Ok(unsafe { EventFd::from_raw_handle(handle.into_raw_handle()) })
+        }
+    }
+
+    /// Rehouse a connected socket in the stream type the `vhost` crate's
+    /// Windows frontend takes.
+    #[cfg(windows)]
+    pub(crate) fn stream_to_uds(stream: unix_socket::UnixStream) -> uds_windows::UnixStream {
+        use std::os::windows::io::FromRawSocket;
+        use std::os::windows::io::IntoRawSocket;
+        let socket: std::os::windows::io::OwnedSocket = stream.into();
+        // SAFETY: `socket` is owned and its ownership transfers to the
+        // returned stream, which closes it on drop.
+        unsafe { uds_windows::UnixStream::from_raw_socket(socket.into_raw_socket()) }
+    }
+}
+
 impl VhostUserFrontend {
-    /// Create from an already-connected socket.
-    pub async fn from_socket(
+    /// Create from a connected socket.
+    #[cfg(unix)]
+    pub async fn from_stream(
         driver: VmTaskDriver,
-        socket: VhostUserSocket,
+        stream: unix_socket::UnixStream,
         config: VhostUserConfig,
     ) -> anyhow::Result<Self> {
-        // Reused across the connection so each recv doesn't allocate.
-        let mut receiver = MessageReceiver::new();
+        let frontend = Frontend::from_stream(stream, config.queue_sizes.len() as u64);
+        Self::new(driver, frontend, config).await
+    }
 
+    /// Create from a connected socket and a handle to the backend process.
+    ///
+    /// The handle needs `PROCESS_DUP_HANDLE` access: guest memory sections
+    /// and vring doorbells are duplicated into the backend process rather
+    /// than passed as descriptors, since Windows `AF_UNIX` sockets carry no
+    /// ancillary data. It must come from whoever launched the backend — it
+    /// cannot be derived from the socket, and a process ID would be racy
+    /// because IDs are reused.
+    #[cfg(windows)]
+    pub async fn from_stream(
+        driver: VmTaskDriver,
+        stream: unix_socket::UnixStream,
+        backend_process: std::os::windows::io::OwnedHandle,
+        config: VhostUserConfig,
+    ) -> anyhow::Result<Self> {
+        let frontend = Frontend::from_stream(
+            convert::stream_to_uds(stream),
+            config.queue_sizes.len() as u64,
+            backend_process,
+        );
+        Self::new(driver, frontend, config).await
+    }
+
+    /// Create from an already-constructed `vhost` frontend, running the
+    /// vhost-user handshake.
+    pub async fn new(
+        driver: VmTaskDriver,
+        frontend: Frontend,
+        config: VhostUserConfig,
+    ) -> anyhow::Result<Self> {
         // 1. GET_FEATURES
         let device_features_raw = VirtioDeviceFeatures::from_bits(
-            send_get_u64(&socket, &mut receiver, VhostUserRequestCode::GET_FEATURES).await?,
+            call(&frontend, |f| f.get_features())
+                .await
+                .context("GET_FEATURES failed")?,
         );
         tracing::trace!(features = %format!("0x{:x}", device_features_raw.into_bits()), "GET_FEATURES");
 
         // 2. Negotiate protocol features (only if the backend advertises them).
         let negotiated_proto = if device_features_raw.vhost_user_protocol_features() {
-            let proto_features_raw = send_get_u64(
-                &socket,
-                &mut receiver,
-                VhostUserRequestCode::GET_PROTOCOL_FEATURES,
-            )
-            .await?;
-            let wanted = VhostUserProtocolFeatures::new()
-                .with_mq(true)
-                .with_reply_ack(true)
-                .with_config(config.use_backend_config)
-                .with_reset_device(true);
-            let negotiated =
-                VhostUserProtocolFeatures::from_bits(proto_features_raw & wanted.into_bits());
-            send_set_u64(
-                &socket,
-                &mut receiver,
-                VhostUserRequestCode::SET_PROTOCOL_FEATURES,
-                negotiated.into_bits(),
-                false, // REPLY_ACK just negotiated — not yet active
-            )
-            .await?;
+            let advertised = call(&frontend, |f| f.get_protocol_features())
+                .await
+                .context("GET_PROTOCOL_FEATURES failed")?;
+            let mut wanted = VhostUserProtocolFeatures::MQ
+                | VhostUserProtocolFeatures::REPLY_ACK
+                | VhostUserProtocolFeatures::RESET_DEVICE;
+            if config.use_backend_config {
+                wanted |= VhostUserProtocolFeatures::CONFIG;
+            }
+            let negotiated = advertised & wanted;
+            call(&frontend, move |f| f.set_protocol_features(negotiated))
+                .await
+                .context("SET_PROTOCOL_FEATURES failed")?;
+            // From here on, ask for and wait on REPLY_ACK acknowledgments if
+            // they were negotiated. (The negotiation message itself went out
+            // before this flag was set, as it must.)
+            if negotiated.contains(VhostUserProtocolFeatures::REPLY_ACK) {
+                frontend.set_hdr_flags(VhostUserHeaderFlag::NEED_REPLY);
+            }
             negotiated
         } else {
-            VhostUserProtocolFeatures::new()
+            VhostUserProtocolFeatures::empty()
         };
 
         // 3. SET_OWNER
-        send_simple(
-            &socket,
-            &mut receiver,
-            VhostUserRequestCode::SET_OWNER,
-            false,
-        )
-        .await?;
+        call(&frontend, |f| f.set_owner())
+            .await
+            .context("SET_OWNER failed")?;
 
         // 4. GET_QUEUE_NUM (requires MQ protocol feature)
-        let backend_max_queues = if negotiated_proto.mq() {
+        let backend_max_queues = if negotiated_proto.contains(VhostUserProtocolFeatures::MQ) {
             Some(
-                send_get_u64(&socket, &mut receiver, VhostUserRequestCode::GET_QUEUE_NUM)
+                call(&frontend, |f| f.get_queue_num())
                     .await
                     .context("GET_QUEUE_NUM failed despite MQ being negotiated")?
                     as u16,
@@ -217,7 +302,8 @@ impl VhostUserFrontend {
         // config size (256); reads beyond the backend's actual config
         // space will return zeros. Otherwise, derive the length from
         // the patches (the guest only sees patched fields).
-        let device_register_length = if negotiated_proto.config() {
+        let device_register_length = if negotiated_proto.contains(VhostUserProtocolFeatures::CONFIG)
+        {
             256
         } else {
             config
@@ -248,8 +334,7 @@ impl VhostUserFrontend {
             driver,
             device_traits,
             protocol_features: negotiated_proto,
-            socket,
-            receiver,
+            frontend,
             queue_sizes,
             config_patches: config.config_patches,
             device_features_raw,
@@ -272,9 +357,17 @@ impl VirtioDevice for VhostUserFrontend {
     }
 
     async fn read_registers_u32(&mut self, offset: u16) -> u32 {
-        let mut buf = if self.protocol_features.config() {
-            match send_get_config(&self.socket, &mut self.receiver, offset as u32, 4).await {
-                Ok(data) if data.len() >= 4 => {
+        let mut buf = if self
+            .protocol_features
+            .contains(VhostUserProtocolFeatures::CONFIG)
+        {
+            tracing::trace!(offset, "GET_CONFIG");
+            match call(&self.frontend, move |f| {
+                f.get_config(offset as u32, 4, VhostUserConfigFlags::empty(), &[0u8; 4])
+            })
+            .await
+            {
+                Ok((_, data)) if data.len() >= 4 => {
                     let mut b = [0u8; 4];
                     b.copy_from_slice(&data[..4]);
                     b
@@ -282,7 +375,7 @@ impl VirtioDevice for VhostUserFrontend {
                 Ok(_) => [0u8; 4],
                 Err(e) => {
                     tracelimit::warn_ratelimited!(
-                        error = &*e as &dyn std::error::Error,
+                        error = &e as &dyn std::error::Error,
                         offset,
                         "GET_CONFIG failed"
                     );
@@ -315,21 +408,25 @@ impl VirtioDevice for VhostUserFrontend {
     }
 
     async fn write_registers_u32(&mut self, offset: u16, val: u32) {
-        if !self.protocol_features.config() {
+        if !self
+            .protocol_features
+            .contains(VhostUserProtocolFeatures::CONFIG)
+        {
             return;
         }
 
-        if let Err(e) = send_set_config(
-            &self.socket,
-            &mut self.receiver,
-            offset,
-            &val.to_le_bytes(),
-            self.protocol_features.reply_ack(),
-        )
+        tracing::trace!(offset, "SET_CONFIG");
+        if let Err(e) = call(&self.frontend, move |f| {
+            f.set_config(
+                offset as u32,
+                VhostUserConfigFlags::empty(),
+                &val.to_le_bytes(),
+            )
+        })
         .await
         {
             tracelimit::warn_ratelimited!(
-                error = &*e as &dyn std::error::Error,
+                error = &e as &dyn std::error::Error,
                 offset,
                 "SET_CONFIG failed"
             );
@@ -361,13 +458,46 @@ impl VirtioDevice for VhostUserFrontend {
                 .map_err(|e| anyhow::anyhow!(e))?;
 
             tracing::trace!(region_count = exported_regions.len(), "SET_MEM_TABLE");
-            send_set_mem_table(
-                &self.socket,
-                &mut self.receiver,
-                &exported_regions,
-                self.protocol_features.reply_ack(),
-            )
-            .await?;
+            for (i, region) in exported_regions.iter().enumerate() {
+                tracing::trace!(
+                    i,
+                    gpa = %format!("0x{:x}", region.guest_address),
+                    size = %format!("0x{:x}", region.size),
+                    userspace_addr = %format!("0x{:x}", region.guest_address + GPA_TO_VA_OFFSET),
+                    mmap_offset = %format!("0x{:x}", region.file_offset),
+                    "SET_MEM_TABLE region",
+                );
+            }
+            // The region table is built inside the closure so that the
+            // backing file objects stay alive for the duration of the send;
+            // the table itself carries only their raw descriptors.
+            call(&self.frontend, move |f| {
+                let regions = exported_regions
+                    .iter()
+                    .map(|region| {
+                        #[cfg(unix)]
+                        let raw = {
+                            use std::os::fd::AsRawFd;
+                            region.file.as_raw_fd()
+                        };
+                        #[cfg(windows)]
+                        let raw = {
+                            use std::os::windows::io::AsRawHandle;
+                            region.file.as_raw_handle()
+                        };
+                        VhostUserMemoryRegionInfo {
+                            guest_phys_addr: region.guest_address,
+                            memory_size: region.size,
+                            userspace_addr: region.guest_address + GPA_TO_VA_OFFSET,
+                            mmap_offset: region.file_offset,
+                            mmap_handle: raw,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                f.set_mem_table(&regions)
+            })
+            .await
+            .context("SET_MEM_TABLE failed")?;
             self.mem_table_sent = true;
             self.guest_memory = Some(resources.guest_memory.clone());
         }
@@ -390,14 +520,9 @@ impl VirtioDevice for VhostUserFrontend {
                 features = %format!("0x{:x}", on_wire.into_bits()),
                 "SET_FEATURES (guest-negotiated)",
             );
-            send_set_u64(
-                &self.socket,
-                &mut self.receiver,
-                VhostUserRequestCode::SET_FEATURES,
-                on_wire.into_bits(),
-                self.protocol_features.reply_ack(),
-            )
-            .await?;
+            call(&self.frontend, move |f| f.set_features(on_wire.into_bits()))
+                .await
+                .context("SET_FEATURES failed")?;
             self.guest_features_sent = true;
             self.packed_ring = negotiated.ring_packed();
         }
@@ -435,53 +560,49 @@ impl VirtioDevice for VhostUserFrontend {
         );
 
         // SET_VRING_NUM
-        send_vring_state(
-            &self.socket,
-            &mut self.receiver,
-            VhostUserRequestCode::SET_VRING_NUM,
-            idx,
-            resources.params.size as u32,
-            self.protocol_features.reply_ack(),
-        )
-        .await?;
+        let size = resources.params.size;
+        call(&self.frontend, move |f| f.set_vring_num(idx.into(), size))
+            .await
+            .context("SET_VRING_NUM failed")?;
 
         // SET_VRING_ADDR — addresses must be in the VA coordinate system
         // (GPA + GPA_TO_VA_OFFSET) matching what we sent in SET_MEM_TABLE.
-        send_vring_addr(
-            &self.socket,
-            &mut self.receiver,
-            idx,
-            resources.params.desc_addr + GPA_TO_VA_OFFSET,
-            resources.params.used_addr + GPA_TO_VA_OFFSET,
-            resources.params.avail_addr + GPA_TO_VA_OFFSET,
-            self.protocol_features.reply_ack(),
-        )
-        .await?;
+        let vring_config = VringConfigData {
+            queue_max_size: size,
+            queue_size: size,
+            flags: 0,
+            desc_table_addr: resources.params.desc_addr + GPA_TO_VA_OFFSET,
+            used_ring_addr: resources.params.used_addr + GPA_TO_VA_OFFSET,
+            avail_ring_addr: resources.params.avail_addr + GPA_TO_VA_OFFSET,
+            log_addr: None,
+        };
+        call(&self.frontend, move |f| {
+            f.set_vring_addr(idx.into(), &vring_config)
+        })
+        .await
+        .context("SET_VRING_ADDR failed")?;
 
-        // SET_VRING_BASE
+        // SET_VRING_BASE. The u16 trait method covers a split ring's avail
+        // index; a packed ring's initial state needs the full 32-bit field.
         tracing::trace!(idx, vring_base = %format!("0x{vring_base:x}"), "SET_VRING_BASE");
-        send_vring_state(
-            &self.socket,
-            &mut self.receiver,
-            VhostUserRequestCode::SET_VRING_BASE,
-            idx,
-            vring_base,
-            self.protocol_features.reply_ack(),
-        )
-        .await?;
+        call(&self.frontend, move |f| {
+            if packed_ring {
+                f.set_vring_base_raw(idx.into(), vring_base)
+            } else {
+                f.set_vring_base(idx.into(), vring_base as u16)
+            }
+        })
+        .await
+        .context("SET_VRING_BASE failed")?;
 
-        // SET_VRING_KICK — pass the kick eventfd to the backend
-        send_vring_fd(
-            &self.socket,
-            &mut self.receiver,
-            VhostUserRequestCode::SET_VRING_KICK,
-            idx,
-            Some(&resources.event),
-            self.protocol_features.reply_ack(),
-        )
-        .await?;
+        // SET_VRING_KICK — pass the kick event to the backend.
+        let kick = convert::event_to_eventfd(&resources.event)
+            .context("failed to duplicate kick event")?;
+        call(&self.frontend, move |f| f.set_vring_kick(idx.into(), &kick))
+            .await
+            .context("SET_VRING_KICK failed")?;
 
-        // SET_VRING_CALL — pass an interrupt eventfd to the backend.
+        // SET_VRING_CALL — pass an interrupt event to the backend.
         //
         // If the transport's interrupt is already event-backed, pass it
         // directly. Otherwise, create an async proxy that bridges a new
@@ -489,26 +610,20 @@ impl VirtioDevice for VhostUserFrontend {
         // backed interrupts where the transport has side effects like
         // updating the ISR register).
         let (call_event, event_proxy) = resources.notify.event_or_proxy(&self.driver)?;
-        send_vring_fd(
-            &self.socket,
-            &mut self.receiver,
-            VhostUserRequestCode::SET_VRING_CALL,
-            idx,
-            Some(&call_event),
-            self.protocol_features.reply_ack(),
-        )
-        .await?;
+        let call_fd = convert::event_to_eventfd(&call_event)
+            .context("failed to duplicate interrupt event")?;
+        call(&self.frontend, move |f| {
+            f.set_vring_call(idx.into(), &call_fd)
+        })
+        .await
+        .context("SET_VRING_CALL failed")?;
 
         // SET_VRING_ENABLE
-        send_vring_state(
-            &self.socket,
-            &mut self.receiver,
-            VhostUserRequestCode::SET_VRING_ENABLE,
-            idx,
-            1,
-            self.protocol_features.reply_ack(),
-        )
-        .await?;
+        call(&self.frontend, move |f| {
+            f.set_vring_enable(idx.into(), true)
+        })
+        .await
+        .context("SET_VRING_ENABLE failed")?;
 
         if let Some(q) = self.queues.get_mut(idx as usize) {
             q.active = true;
@@ -528,18 +643,13 @@ impl VirtioDevice for VhostUserFrontend {
         // SET_VRING_ENABLE(0) before GET_VRING_BASE to ensure the
         // backend's data plane stops processing kicks before the
         // control plane tears down the queue.
-        if let Err(e) = send_vring_state(
-            &self.socket,
-            &mut self.receiver,
-            VhostUserRequestCode::SET_VRING_ENABLE,
-            idx,
-            0,
-            self.protocol_features.reply_ack(),
-        )
+        if let Err(e) = call(&self.frontend, move |f| {
+            f.set_vring_enable(idx.into(), false)
+        })
         .await
         {
             tracelimit::warn_ratelimited!(
-                error = &*e as &dyn std::error::Error,
+                error = &e as &dyn std::error::Error,
                 idx,
                 "SET_VRING_ENABLE(0) failed during stop_queue"
             );
@@ -551,11 +661,11 @@ impl VirtioDevice for VhostUserFrontend {
         //   bits 16-31: used state (index + wrap counter)
         // For split ring, only the low 16 bits matter (avail index),
         // and used_index is read from the guest-visible used ring.
-        let vring_base = match send_get_vring_base(&self.socket, &mut self.receiver, idx).await {
+        let vring_base = match call(&self.frontend, move |f| f.get_vring_base(idx.into())).await {
             Ok(base) => base,
             Err(e) => {
                 tracelimit::warn_ratelimited!(
-                    error = &*e as &dyn std::error::Error,
+                    error = &e as &dyn std::error::Error,
                     idx,
                     "GET_VRING_BASE failed during stop_queue; marking queue inactive"
                 );
@@ -597,27 +707,17 @@ impl VirtioDevice for VhostUserFrontend {
         // Stop all active queues.
         for idx in 0..self.queues.len() {
             if self.queues[idx].active {
-                if let Err(e) = send_vring_state(
-                    &self.socket,
-                    &mut self.receiver,
-                    VhostUserRequestCode::SET_VRING_ENABLE,
-                    idx as u16,
-                    0,
-                    self.protocol_features.reply_ack(),
-                )
-                .await
+                if let Err(e) = call(&self.frontend, move |f| f.set_vring_enable(idx, false)).await
                 {
                     tracelimit::warn_ratelimited!(
-                        error = &*e as &dyn std::error::Error,
+                        error = &e as &dyn std::error::Error,
                         idx,
                         "SET_VRING_ENABLE(0) failed during reset"
                     );
                 }
-                if let Err(e) =
-                    send_get_vring_base(&self.socket, &mut self.receiver, idx as u16).await
-                {
+                if let Err(e) = call(&self.frontend, move |f| f.get_vring_base(idx)).await {
                     tracelimit::warn_ratelimited!(
-                        error = &*e as &dyn std::error::Error,
+                        error = &e as &dyn std::error::Error,
                         idx,
                         "GET_VRING_BASE failed during reset"
                     );
@@ -630,17 +730,13 @@ impl VirtioDevice for VhostUserFrontend {
         self.guest_features_sent = false;
         self.packed_ring = false;
         // Send RESET_DEVICE if negotiated.
-        if self.protocol_features.reset_device() {
-            if let Err(e) = send_simple(
-                &self.socket,
-                &mut self.receiver,
-                VhostUserRequestCode::RESET_DEVICE,
-                self.protocol_features.reply_ack(),
-            )
-            .await
-            {
+        if self
+            .protocol_features
+            .contains(VhostUserProtocolFeatures::RESET_DEVICE)
+        {
+            if let Err(e) = call(&self.frontend, |f| f.reset_device()).await {
                 tracelimit::warn_ratelimited!(
-                    error = &*e as &dyn std::error::Error,
+                    error = &e as &dyn std::error::Error,
                     "RESET_DEVICE failed during reset"
                 );
             }
@@ -650,395 +746,6 @@ impl VirtioDevice for VhostUserFrontend {
     fn supports_save_restore(&self) -> bool {
         true
     }
-}
-
-// ---------------------------------------------------------------------------
-// Protocol helper functions
-// ---------------------------------------------------------------------------
-
-/// Validate a reply header: check version flag, reply flag, and request code.
-fn validate_reply(
-    reply_hdr: &VhostUserMsgHeader,
-    expected_code: VhostUserRequestCode,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(reply_hdr.version_valid(), "reply has invalid version flag");
-    anyhow::ensure!(reply_hdr.is_reply(), "expected reply flag in response");
-    anyhow::ensure!(
-        reply_hdr.code() == expected_code,
-        "reply code {:?} does not match expected {:?}",
-        reply_hdr.code(),
-        expected_code,
-    );
-    Ok(())
-}
-
-/// Send a request and receive a validated reply.
-///
-/// Validates version, reply flag, and that the reply code matches.
-/// Returns the reply payload and any file descriptors.
-async fn send_and_recv(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    code: VhostUserRequestCode,
-    payload: &[u8],
-    objects: &[impl AsMappableRef],
-) -> anyhow::Result<(Vec<u8>, Vec<Mappable>)> {
-    let hdr = VhostUserMsgHeader {
-        request: code.0,
-        flags: VHOST_USER_FLAG_VERSION,
-        size: payload.len() as u32,
-    };
-    socket.send_message(&hdr, payload, objects).await?;
-    let (reply_hdr, reply_payload, reply_fds) = socket.recv_message(receiver).await?;
-    validate_reply(&reply_hdr, code)?;
-    Ok((reply_payload, reply_fds))
-}
-
-/// Receive and validate a REPLY_ACK response.
-async fn recv_ack(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    expected_code: VhostUserRequestCode,
-) -> anyhow::Result<()> {
-    let (reply_hdr, payload, _fds) = socket.recv_message(receiver).await?;
-    validate_reply(&reply_hdr, expected_code)?;
-    let msg = VhostUserU64Msg::read_from_prefix(&payload)
-        .map(|(val, _)| val)
-        .map_err(|_| anyhow::anyhow!("ACK reply payload too small"))?;
-    anyhow::ensure!(
-        msg.value == 0,
-        "backend returned error in ACK: {}",
-        msg.value
-    );
-    Ok(())
-}
-
-/// Build the flags field for a request, optionally including NEED_REPLY.
-fn request_flags(reply_ack: bool) -> u32 {
-    let mut flags = VHOST_USER_FLAG_VERSION;
-    if reply_ack {
-        flags |= VHOST_USER_FLAG_NEED_REPLY;
-    }
-    flags
-}
-
-/// Send a request with no payload and receive a u64 reply.
-async fn send_get_u64(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    code: VhostUserRequestCode,
-) -> anyhow::Result<u64> {
-    tracing::trace!(code = ?code, "send_get_u64");
-    let (payload, _fds) = send_and_recv(socket, receiver, code, &[], &[] as &[Mappable]).await?;
-    let msg = VhostUserU64Msg::read_from_prefix(&payload)
-        .map(|(val, _)| val)
-        .map_err(|_| anyhow::anyhow!("reply payload too small for u64"))?;
-    tracing::trace!(code = ?code, value = %format!("0x{:x}", msg.value), "send_get_u64 reply");
-    Ok(msg.value)
-}
-
-/// Send a SET request with a u64 payload.
-async fn send_set_u64(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    code: VhostUserRequestCode,
-    value: u64,
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    let hdr = VhostUserMsgHeader {
-        request: code.0,
-        flags: request_flags(reply_ack),
-        size: size_of::<VhostUserU64Msg>() as u32,
-    };
-    let payload = VhostUserU64Msg { value };
-    tracing::trace!(code = ?code, value = %format!("0x{value:x}"), "send_set_u64");
-    socket
-        .send_message(&hdr, payload.as_bytes(), &[] as &[Mappable])
-        .await?;
-    if reply_ack {
-        recv_ack(socket, receiver, code).await?;
-    }
-    Ok(())
-}
-
-/// Send a request with no payload (e.g., SET_OWNER, RESET_DEVICE).
-async fn send_simple(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    code: VhostUserRequestCode,
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    let hdr = VhostUserMsgHeader {
-        request: code.0,
-        flags: request_flags(reply_ack),
-        size: 0,
-    };
-    tracing::trace!(code = ?code, "send_simple");
-    socket.send_message(&hdr, &[], &[] as &[Mappable]).await?;
-    if reply_ack {
-        recv_ack(socket, receiver, code).await?;
-    }
-    Ok(())
-}
-
-/// Send SET_MEM_TABLE with exported memory regions.
-async fn send_set_mem_table(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    regions: &[ShareableRegion],
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        regions.len() <= VHOST_USER_MAX_FDS,
-        "too many memory regions ({}) for SET_MEM_TABLE (max {})",
-        regions.len(),
-        VHOST_USER_MAX_FDS,
-    );
-
-    // Payload: { nregions: u32, padding: u32, regions: [VhostUserMemoryRegion] }
-    let nregions = regions.len() as u32;
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&nregions.to_le_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes()); // padding
-
-    let mut objects = Vec::new();
-    for (i, region) in regions.iter().enumerate() {
-        let wire_region = VhostUserMemoryRegion {
-            guest_phys_addr: region.guest_address,
-            memory_size: region.size,
-            userspace_addr: region.guest_address + GPA_TO_VA_OFFSET,
-            mmap_offset: region.file_offset,
-        };
-        tracing::trace!(
-            i,
-            gpa = %format!("0x{:x}", region.guest_address),
-            size = %format!("0x{:x}", region.size),
-            userspace_addr = %format!("0x{:x}", wire_region.userspace_addr),
-            mmap_offset = %format!("0x{:x}", region.file_offset),
-            "SET_MEM_TABLE region",
-        );
-        payload.extend_from_slice(wire_region.as_bytes());
-        objects.push(&region.file);
-    }
-
-    let hdr = VhostUserMsgHeader {
-        request: VhostUserRequestCode::SET_MEM_TABLE.0,
-        flags: request_flags(reply_ack),
-        size: payload.len() as u32,
-    };
-    socket.send_message(&hdr, &payload, &objects).await?;
-    if reply_ack {
-        recv_ack(socket, receiver, VhostUserRequestCode::SET_MEM_TABLE).await?;
-    }
-    Ok(())
-}
-
-/// Send a VringState message (SET_VRING_NUM, SET_VRING_BASE, SET_VRING_ENABLE).
-async fn send_vring_state(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    code: VhostUserRequestCode,
-    index: u16,
-    num: u32,
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    let hdr = VhostUserMsgHeader {
-        request: code.0,
-        flags: request_flags(reply_ack),
-        size: size_of::<VhostUserVringState>() as u32,
-    };
-    let payload = VhostUserVringState {
-        index: index as u32,
-        num,
-    };
-    tracing::trace!(code = ?code, index, num = %format!("0x{num:x}"), "send_vring_state");
-    socket
-        .send_message(&hdr, payload.as_bytes(), &[] as &[Mappable])
-        .await?;
-    if reply_ack {
-        recv_ack(socket, receiver, code).await?;
-    }
-    Ok(())
-}
-
-/// Send SET_VRING_ADDR.
-async fn send_vring_addr(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    index: u16,
-    desc_addr: u64,
-    used_addr: u64,
-    avail_addr: u64,
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    let hdr = VhostUserMsgHeader {
-        request: VhostUserRequestCode::SET_VRING_ADDR.0,
-        flags: request_flags(reply_ack),
-        size: size_of::<VhostUserVringAddr>() as u32,
-    };
-    let payload = VhostUserVringAddr {
-        index: index as u32,
-        flags: 0,
-        desc_user_addr: desc_addr,
-        used_user_addr: used_addr,
-        avail_user_addr: avail_addr,
-        log_guest_addr: 0,
-    };
-    tracing::trace!(
-        index,
-        desc = %format!("0x{desc_addr:x}"),
-        used = %format!("0x{used_addr:x}"),
-        avail = %format!("0x{avail_addr:x}"),
-        "SET_VRING_ADDR",
-    );
-    socket
-        .send_message(&hdr, payload.as_bytes(), &[] as &[Mappable])
-        .await?;
-    if reply_ack {
-        recv_ack(socket, receiver, VhostUserRequestCode::SET_VRING_ADDR).await?;
-    }
-    Ok(())
-}
-
-/// Send SET_VRING_KICK or SET_VRING_CALL with an optional fd.
-async fn send_vring_fd(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    code: VhostUserRequestCode,
-    index: u16,
-    event: Option<&(impl AsMappableRef + ?Sized)>,
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    let nofd = event.is_none();
-    let value = (index as u64 & VHOST_USER_VRING_INDEX_MASK)
-        | if nofd { VHOST_USER_VRING_NOFD_MASK } else { 0 };
-
-    let hdr = VhostUserMsgHeader {
-        request: code.0,
-        flags: request_flags(reply_ack),
-        size: size_of::<VhostUserU64Msg>() as u32,
-    };
-    let payload = VhostUserU64Msg { value };
-
-    tracing::trace!(code = ?code, index, nofd, "send_vring_fd");
-    if let Some(event) = event {
-        socket
-            .send_message(&hdr, payload.as_bytes(), &[event])
-            .await?;
-    } else {
-        socket
-            .send_message(&hdr, payload.as_bytes(), &[] as &[Mappable])
-            .await?;
-    }
-    if reply_ack {
-        recv_ack(socket, receiver, code).await?;
-    }
-    Ok(())
-}
-
-/// Send GET_VRING_BASE — this implicitly stops the queue on the backend
-/// and returns the raw vring base value.
-///
-/// For split ring, only the low 16 bits are meaningful (avail index).
-/// For packed ring, the full u32 encodes both avail (low 16) and used
-/// (high 16) state.
-async fn send_get_vring_base(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    index: u16,
-) -> anyhow::Result<u32> {
-    let payload = VhostUserVringState {
-        index: index as u32,
-        num: 0,
-    };
-    let (reply_payload, _fds) = send_and_recv(
-        socket,
-        receiver,
-        VhostUserRequestCode::GET_VRING_BASE,
-        payload.as_bytes(),
-        &[] as &[Mappable],
-    )
-    .await?;
-    let reply = VhostUserVringState::read_from_prefix(&reply_payload)
-        .map(|(val, _)| val)
-        .map_err(|_| anyhow::anyhow!("GET_VRING_BASE reply too small"))?;
-    Ok(reply.num)
-}
-
-/// Send GET_CONFIG and return the config bytes.
-async fn send_get_config(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    offset: u32,
-    size: u32,
-) -> anyhow::Result<Vec<u8>> {
-    let config_hdr = VhostUserConfigHeader {
-        offset,
-        size,
-        flags: 0,
-    };
-    // The vhost-user spec requires the payload to be the config header
-    // followed by `size` bytes of buffer space (zeroed for GET).
-    let mut request_payload =
-        Vec::with_capacity(size_of::<VhostUserConfigHeader>() + size as usize);
-    request_payload.extend_from_slice(config_hdr.as_bytes());
-    request_payload.resize(size_of::<VhostUserConfigHeader>() + size as usize, 0);
-
-    tracing::trace!(offset, size, "GET_CONFIG");
-    let (reply_payload, _fds) = send_and_recv(
-        socket,
-        receiver,
-        VhostUserRequestCode::GET_CONFIG,
-        &request_payload,
-        &[] as &[Mappable],
-    )
-    .await?;
-    // Reply: config header + config data.
-    let hdr_size = size_of::<VhostUserConfigHeader>();
-    let config_data = if reply_payload.len() > hdr_size {
-        reply_payload[hdr_size..].to_vec()
-    } else {
-        Vec::new()
-    };
-    tracing::trace!(
-        offset,
-        size,
-        config_len = config_data.len(),
-        "GET_CONFIG reply"
-    );
-    Ok(config_data)
-}
-
-/// Send SET_CONFIG.
-async fn send_set_config(
-    socket: &VhostUserSocket,
-    receiver: &mut MessageReceiver,
-    offset: u16,
-    data: &[u8],
-    reply_ack: bool,
-) -> anyhow::Result<()> {
-    let config_hdr = VhostUserConfigHeader {
-        offset: offset as u32,
-        size: data.len() as u32,
-        flags: 0,
-    };
-    let mut payload = Vec::with_capacity(size_of::<VhostUserConfigHeader>() + data.len());
-    payload.extend_from_slice(config_hdr.as_bytes());
-    payload.extend_from_slice(data);
-
-    let hdr = VhostUserMsgHeader {
-        request: VhostUserRequestCode::SET_CONFIG.0,
-        flags: request_flags(reply_ack),
-        size: payload.len() as u32,
-    };
-    tracing::trace!(offset, size = data.len(), "SET_CONFIG");
-    socket
-        .send_message(&hdr, &payload, &[] as &[Mappable])
-        .await?;
-    if reply_ack {
-        recv_ack(socket, receiver, VhostUserRequestCode::SET_CONFIG).await?;
-    }
-    Ok(())
 }
 
 /// Read the used_index from the used ring in guest memory.
@@ -1056,10 +763,11 @@ fn read_used_index(mem: &GuestMemory, params: &virtio::queue::QueueParams) -> u1
 }
 
 // These tests drive a real backend over a loopback socket, which means
-// `vhost_user_backend` — openvmm's own backend, and Linux-only. The Windows
-// transport's own contract is covered by the unit tests in
-// `vhost_user_protocol::win32`; end to end it is exercised against an external
-// backend.
+// `vhost_user_backend` — openvmm's own backend, and Linux-only. The frontend
+// half runs through the `vhost` crate, so they also cross-check the two
+// implementations against each other. The Windows transport's own contract is
+// covered by the `vhost` crate's tests; end to end it is exercised against an
+// external backend.
 #[cfg(all(test, target_os = "linux"))]
 // UNSAFETY: Implementing GuestMemoryAccess for test-only ShareableGuestMemory.
 #[expect(unsafe_code)]
@@ -1067,12 +775,14 @@ mod tests {
     use super::*;
     use guestmem::GuestMemorySharing;
     use guestmem::ProvideShareableRegions;
+    use guestmem::ShareableRegion;
     use guestmem::ShareableRegionError;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::socket::PolledSocket;
     use pal_async::task::Spawn;
     use pal_event::Event;
+    use sparse_mmap::Mappable;
     use sparse_mmap::SparseMapping;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
@@ -1080,6 +790,7 @@ mod tests {
     use test_with_tracing::test;
     use unix_socket::UnixStream;
     use vhost_user_backend::VhostUserDeviceServer;
+    use vhost_user_protocol::VhostUserSocket;
     use virtio::DEFAULT_QUEUE_SIZE;
     use virtio::DeviceTraits;
     use virtio::DeviceTraitsSharedMemory;
@@ -1229,26 +940,9 @@ mod tests {
     async fn setup_frontend_backend(
         driver: &DefaultDriver,
     ) -> (VhostUserFrontend, GuestMemory, pal_async::task::Task<()>) {
-        let (frontend_stream, backend_stream) = socket_pair();
-
-        let backend_polled = PolledSocket::new(driver, backend_stream).unwrap();
-        let backend_socket = VhostUserSocket::new(backend_polled);
-
-        let server = VhostUserDeviceServer::new(Box::new(MockBackendDevice::new()));
-
-        let backend_task = driver.spawn("backend", async move {
-            server.serve_connection(backend_socket).await.unwrap();
-        });
-
-        let frontend_polled = PolledSocket::new(driver, frontend_stream).unwrap();
-        let frontend_socket = VhostUserSocket::new(frontend_polled);
-
-        let guest_memory = ShareableGuestMemory::new(65536).into_guest_memory();
-
-        let vm_driver = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())).simple();
-        let frontend = VhostUserFrontend::from_socket(
-            vm_driver,
-            frontend_socket,
+        setup_frontend_backend_with_config(
+            driver,
+            MockBackendDevice::new(),
             VhostUserConfig {
                 device_id: VirtioDeviceType::BLK,
                 use_backend_config: true,
@@ -1257,9 +951,6 @@ mod tests {
             },
         )
         .await
-        .expect("frontend handshake failed");
-
-        (frontend, guest_memory, backend_task)
     }
 
     /// Build dummy QueueResources with the given interrupt.
@@ -1472,13 +1163,10 @@ mod tests {
             server.serve_connection(backend_socket).await.unwrap();
         });
 
-        let frontend_polled = PolledSocket::new(driver, frontend_stream).unwrap();
-        let frontend_socket = VhostUserSocket::new(frontend_polled);
-
         let guest_memory = ShareableGuestMemory::new(65536).into_guest_memory();
 
         let vm_driver = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())).simple();
-        let frontend = VhostUserFrontend::from_socket(vm_driver, frontend_socket, config)
+        let frontend = VhostUserFrontend::from_stream(vm_driver, frontend_stream, config)
             .await
             .expect("frontend handshake failed");
 
@@ -1639,19 +1327,6 @@ mod tests {
         use virtio::spec::fs as virtio_fs;
         use zerocopy::IntoBytes;
 
-        let (frontend_stream, backend_stream) = socket_pair();
-
-        let backend_polled = PolledSocket::new(&driver, backend_stream).unwrap();
-        let backend_socket = VhostUserSocket::new(backend_polled);
-
-        let server = VhostUserDeviceServer::new(Box::new(MockBackendDevice::new()));
-        let backend_task = driver.spawn("backend", async move {
-            server.serve_connection(backend_socket).await.unwrap();
-        });
-
-        let frontend_polled = PolledSocket::new(&driver, frontend_stream).unwrap();
-        let frontend_socket = VhostUserSocket::new(frontend_polled);
-
         // Build a virtio-fs config with a known tag.
         let mut config = virtio_fs::Config {
             tag: [0; virtio_fs::TAG_LEN],
@@ -1661,10 +1336,9 @@ mod tests {
         config.tag[..tag.len()].copy_from_slice(tag);
         let config_bytes = config.as_bytes().to_vec();
 
-        let vm_driver = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())).simple();
-        let mut frontend = VhostUserFrontend::from_socket(
-            vm_driver,
-            frontend_socket,
+        let (mut frontend, _guest_memory, backend_task) = setup_frontend_backend_with_config(
+            &driver,
+            MockBackendDevice::new(),
             VhostUserConfig {
                 device_id: VirtioDeviceType::FS,
                 use_backend_config: false,
@@ -1672,11 +1346,14 @@ mod tests {
                 config_patches: vec![(0, config_bytes.clone())],
             },
         )
-        .await
-        .expect("frontend handshake failed");
+        .await;
 
         // CONFIG should NOT be negotiated.
-        assert!(!frontend.protocol_features.config());
+        assert!(
+            !frontend
+                .protocol_features
+                .contains(VhostUserProtocolFeatures::CONFIG)
+        );
 
         // Config register length should match the provided config.
         assert_eq!(
@@ -1842,11 +1519,8 @@ mod tests {
             let _ = server.serve_connection(backend_socket).await;
         });
 
-        let frontend_polled = PolledSocket::new(&driver, frontend_stream).unwrap();
-        let frontend_socket = VhostUserSocket::new(frontend_polled);
-
         let vm_driver = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())).simple();
-        let result = VhostUserFrontend::from_socket(vm_driver, frontend_socket, config).await;
+        let result = VhostUserFrontend::from_stream(vm_driver, frontend_stream, config).await;
 
         let err = result
             .err()

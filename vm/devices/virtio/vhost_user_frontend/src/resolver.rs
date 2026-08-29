@@ -6,8 +6,6 @@
 use crate::VhostUserFrontend;
 use anyhow::Context as _;
 use async_trait::async_trait;
-use pal_async::socket::PolledSocket;
-use vhost_user_protocol::VhostUserSocket;
 use virtio::resolve::ResolvedVirtioDevice;
 use virtio::resolve::VirtioResolveInput;
 use virtio::spec::VirtioDeviceType;
@@ -39,25 +37,28 @@ async fn connect_frontend(
     config: crate::VhostUserConfig,
 ) -> anyhow::Result<VhostUserFrontend> {
     let driver = input.driver_source.simple();
-    let polled = PolledSocket::new(&driver, connection.socket)
-        .context("failed to register vhost-user socket")?;
 
     // On Windows, guest memory and the doorbells are duplicated into the
-    // backend process, so the frontend needs a handle to it. Without one the
-    // connection still negotiates, and fails on the first message that carries
-    // an object — which reports the missing handle at the point it is needed
-    // rather than refusing a connection that may never need it.
+    // backend process, so the frontend needs a handle to it before the
+    // connection can serve a device. Requiring it here reports the missing
+    // handle at the point the device is configured, rather than at the first
+    // message that carries an object.
     #[cfg(windows)]
-    let socket = match connection.backend_process {
-        Some(process) => VhostUserSocket::with_peer_process(polled, process),
-        None => VhostUserSocket::new(polled),
-    };
+    {
+        let backend_process = connection.backend_process.context(
+            "vhost-user on Windows requires a handle to the backend process \
+             (see the backend_process= option)",
+        )?;
+        VhostUserFrontend::from_stream(driver, connection.socket, backend_process, config)
+            .await
+            .context("vhost-user handshake failed")
+    }
     #[cfg(unix)]
-    let socket = VhostUserSocket::new(polled);
-
-    VhostUserFrontend::from_socket(driver, socket, config)
-        .await
-        .context("vhost-user handshake failed")
+    {
+        VhostUserFrontend::from_stream(driver, connection.socket, config)
+            .await
+            .context("vhost-user handshake failed")
+    }
 }
 
 #[async_trait]
