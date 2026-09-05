@@ -483,7 +483,7 @@ impl VirtioDevice for VhostUserFrontend {
                         #[cfg(windows)]
                         let raw = {
                             use std::os::windows::io::AsRawHandle;
-                            region.file.as_raw_handle()
+                            region.file.as_raw_handle() as isize
                         };
                         VhostUserMemoryRegionInfo {
                             guest_phys_addr: region.guest_address,

@@ -754,8 +754,8 @@ pbjson-build = { git = "https://github.com/jstarks/pbjson", branch = "aliases" }
 # Windows support (file-mapping sections, events, AF_UNIX descriptors) that the vhost fork above
 # builds on; pending upstream in rust-vmm. `[patch]` only applies from the top-level manifest, so
 # the vhost fork's own pins to these revs do not reach here and this workspace must repeat them.
-vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307" }
-vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307" }
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "664ef7d866fa8e7e09511eb76a2ec1d501394fda" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "664ef7d866fa8e7e09511eb76a2ec1d501394fda" }
 
 [workspace.lints.rust]
 # Lint groups need a priority lower than individual lints so they get applied first.

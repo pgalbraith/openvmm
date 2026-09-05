@@ -1482,7 +1482,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1992,7 +1992,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7219,7 +7219,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8248,7 +8248,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.8",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8770,7 +8770,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9497,7 +9497,7 @@ dependencies = [
 [[package]]
 name = "vhost"
 version = "0.17.0"
-source = "git+https://github.com/pgalbraith/vhost.git?branch=windows-raw#444a1c47699f087e845990a6c996d630d6e06172"
+source = "git+https://github.com/pgalbraith/vhost.git?branch=windows-raw#eff66eaa0e943e6f69e86829989985f7409707fd"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
@@ -10125,7 +10125,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 [[package]]
 name = "vm-memory"
 version = "0.18.0"
-source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307#045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307"
+source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=664ef7d866fa8e7e09511eb76a2ec1d501394fda#664ef7d866fa8e7e09511eb76a2ec1d501394fda"
 dependencies = [
  "libc",
  "thiserror 2.0.16",
@@ -10667,7 +10667,7 @@ dependencies = [
 [[package]]
 name = "vmm-sys-util"
 version = "0.15.0"
-source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307#045cbc3acf6f4fed2607ee7b3ea1d8b6c175b307"
+source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=664ef7d866fa8e7e09511eb76a2ec1d501394fda#664ef7d866fa8e7e09511eb76a2ec1d501394fda"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
@@ -11335,7 +11335,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0978bf7171b3d90bac376700cb56d606feb40f251a475a5d6634613564460b22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
